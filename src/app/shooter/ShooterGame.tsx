@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
@@ -15,6 +16,25 @@ const CENTER_X = WIDTH / 2;
 const CENTER_Y = HEIGHT / 2;
 const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 const BULLET_CHARS = [".", "/", ";"];
+const BOSS_WORDS = [
+  "RUSH",
+  "FIRE",
+  "RAGE",
+  "DOOM",
+  "BURN",
+  "KILL",
+  "HUNT",
+  "WAVE",
+  "CHAR",
+  "SLAM",
+  "NUKE",
+  "MAUL",
+  "BANE",
+  "VOID",
+];
+const PLAYER_FONT_PX = 52;
+const PLAYER_LETTER_W = 34;
+const PLAYER_HALF_H = 34;
 
 type Enemy = {
   id: string;
@@ -23,9 +43,12 @@ type Enemy = {
   y: number;
   z: number;
   hp: number;
+  maxHp: number;
   speed: number;
   wobble: number;
   phase: number;
+  groupId: string | null;
+  isWordBoss: boolean;
   dead?: boolean;
 };
 
@@ -49,16 +72,23 @@ type Particle = {
   ch: string;
 };
 
+type WordGroup = { word: string; remaining: number };
+
+type Banner = { text: string; life: number };
+
 type GameState = {
   enemies: Enemy[];
   shots: Shot[];
   particles: Particle[];
+  groups: Record<string, WordGroup>;
   spawnTimer: number;
+  wordTimer: number;
   hitFlash: number;
   score: number;
   hp: number;
   wave: number;
   gameOver: boolean;
+  banner: Banner | null;
 };
 
 function makeInitialState(): GameState {
@@ -66,17 +96,24 @@ function makeInitialState(): GameState {
     enemies: [],
     shots: [],
     particles: [],
+    groups: {},
     spawnTimer: 0,
+    wordTimer: 6000,
     hitFlash: 0,
     score: 0,
     hp: 5,
     wave: 1,
     gameOver: false,
+    banner: null,
   };
 }
 
 function rand(min: number, max: number): number {
   return Math.random() * (max - min) + min;
+}
+
+function pick<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
 function uid(): string {
@@ -88,20 +125,57 @@ function uid(): string {
 
 function createEnemy(wave: number): Enemy {
   const angle = rand(0, Math.PI * 2);
-  const radius = rand(220, 340);
+  const radius = rand(240, 360);
   const letterIndexMax = Math.min(LETTERS.length - 1, 4 + wave);
   const ch = LETTERS[Math.floor(rand(0, letterIndexMax + 1))];
+  const hp = 1 + Math.floor(wave / 4);
   return {
     id: uid(),
     ch,
     x: CENTER_X + Math.cos(angle) * radius,
     y: CENTER_Y + Math.sin(angle) * radius,
     z: rand(0.15, 0.45),
-    hp: 1 + Math.floor(wave / 4),
+    hp,
+    maxHp: hp,
     speed: 0.22 + wave * 0.018 + rand(0, 0.08),
     wobble: rand(0, Math.PI * 2),
     phase: rand(0, Math.PI * 2),
+    groupId: null,
+    isWordBoss: false,
   };
+}
+
+function createWordBoss(wave: number, word: string): Enemy[] {
+  const angle = rand(0, Math.PI * 2);
+  const radius = 420;
+  const cx = CENTER_X + Math.cos(angle) * radius;
+  const cy = CENTER_Y + Math.sin(angle) * radius;
+  const tangentX = -Math.sin(angle);
+  const tangentY = Math.cos(angle);
+  const spacing = 46;
+  const groupId = uid();
+  const hp = 3 + Math.floor(wave * 0.75);
+  const speed = 0.16 + wave * 0.013;
+  const phase = rand(0, Math.PI * 2);
+  const out: Enemy[] = [];
+  for (let i = 0; i < word.length; i++) {
+    const off = (i - (word.length - 1) / 2) * spacing;
+    out.push({
+      id: uid(),
+      ch: word[i],
+      x: cx + tangentX * off,
+      y: cy + tangentY * off,
+      z: 0.32,
+      hp,
+      maxHp: hp,
+      speed,
+      wobble: 0.2,
+      phase,
+      groupId,
+      isWordBoss: true,
+    });
+  }
+  return out;
 }
 
 function createShot(targetX: number, targetY: number, ch: string): Shot {
@@ -144,6 +218,75 @@ function drawBackground(ctx: CanvasRenderingContext2D, t: number): void {
   ctx.restore();
 }
 
+function playerBox(name: string): {
+  halfW: number;
+  halfH: number;
+} {
+  return {
+    halfW: Math.max(1, name.length) * PLAYER_LETTER_W,
+    halfH: PLAYER_HALF_H,
+  };
+}
+
+function drawPlayerArea(
+  ctx: CanvasRenderingContext2D,
+  name: string,
+  t: number,
+  flashing: boolean
+): void {
+  const { halfW, halfH } = playerBox(name);
+  const pulse = 0.25 + 0.15 * Math.sin(t * 0.005);
+  ctx.save();
+  ctx.strokeStyle = flashing
+    ? `rgba(255,120,120,${0.55 + pulse})`
+    : `rgba(120,220,255,${0.35 + pulse})`;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  const pad = 10;
+  const x = CENTER_X - halfW - pad;
+  const y = CENTER_Y - halfH - pad;
+  const w = halfW * 2 + pad * 2;
+  const h = halfH * 2 + pad * 2;
+  const r = 12;
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `bold ${PLAYER_FONT_PX}px monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowBlur = 22;
+  ctx.shadowColor = flashing
+    ? "rgba(255,120,120,0.8)"
+    : "rgba(100,180,255,0.65)";
+  ctx.fillStyle = flashing
+    ? "rgba(255,200,200,0.98)"
+    : "rgba(200,240,255,0.98)";
+  ctx.fillText(name, CENTER_X, CENTER_Y);
+  ctx.restore();
+}
+
+function sanitizeName(raw: string): string {
+  return raw.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
+}
+
+function finalizeName(raw: string): string {
+  const cleaned = sanitizeName(raw);
+  if (cleaned.length === 0) return "AAA";
+  return cleaned.padEnd(3, cleaned[cleaned.length - 1]);
+}
+
 export default function ShooterGame() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mouseRef = useRef({ x: CENTER_X, y: CENTER_Y });
@@ -152,6 +295,7 @@ export default function ShooterGame() {
   const pointerDownRef = useRef(false);
   const ammoModeRef = useRef(0);
   const startedRef = useRef(false);
+  const playerNameRef = useRef("AAA");
   const stateRef = useRef<GameState>(makeInitialState());
 
   const [started, setStarted] = useState(false);
@@ -160,6 +304,7 @@ export default function ShooterGame() {
   const [wave, setWave] = useState(1);
   const [ammoMode, setAmmoMode] = useState(0);
   const [gameOver, setGameOver] = useState(false);
+  const [playerName, setPlayerName] = useState("AAA");
 
   const weaponLabel = useMemo(() => BULLET_CHARS[ammoMode], [ammoMode]);
 
@@ -169,6 +314,9 @@ export default function ShooterGame() {
   useEffect(() => {
     startedRef.current = started;
   }, [started]);
+  useEffect(() => {
+    playerNameRef.current = playerName.length === 0 ? "AAA" : playerName;
+  }, [playerName]);
 
   const shoot = useCallback(() => {
     const s = stateRef.current;
@@ -182,13 +330,26 @@ export default function ShooterGame() {
     );
   }, []);
 
-  const restart = useCallback(() => {
+  const startGame = useCallback(() => {
+    setPlayerName((n) => finalizeName(n));
     stateRef.current = makeInitialState();
     setScore(0);
     setHp(5);
     setWave(1);
     setGameOver(false);
     setStarted(true);
+  }, []);
+
+  const restart = useCallback(() => {
+    startGame();
+  }, [startGame]);
+
+  const onNameChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setPlayerName(sanitizeName(e.target.value));
+  }, []);
+
+  const onNameBlur = useCallback(() => {
+    setPlayerName((n) => finalizeName(n));
   }, []);
 
   useEffect(() => {
@@ -202,9 +363,15 @@ export default function ShooterGame() {
         y: ((clientY - rect.top) / rect.height) * HEIGHT,
       };
     };
-
     const onMove = (e: MouseEvent) => setAim(e.clientX, e.clientY);
     const onKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
       keysRef.current[e.key.toLowerCase()] = true;
       if (["1", "2", "3"].includes(e.key)) setAmmoMode(Number(e.key) - 1);
       if (e.key.toLowerCase() === "r" && stateRef.current.gameOver) restart();
@@ -213,7 +380,6 @@ export default function ShooterGame() {
     const onKeyUp = (e: KeyboardEvent) => {
       keysRef.current[e.key.toLowerCase()] = false;
     };
-
     window.addEventListener("mousemove", onMove);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
@@ -232,24 +398,17 @@ export default function ShooterGame() {
 
     let last = performance.now();
 
-    const setAim = (clientX: number, clientY: number) => {
-      const rect = canvas.getBoundingClientRect();
-      mouseRef.current = {
-        x: ((clientX - rect.left) / rect.width) * WIDTH,
-        y: ((clientY - rect.top) / rect.height) * HEIGHT,
-      };
-    };
-
-    const explode = (x: number, y: number, ch: string) => {
+    const explode = (x: number, y: number, ch: string, big: boolean) => {
       const s = stateRef.current;
-      for (let i = 0; i < 10; i++) {
+      const count = big ? 22 : 10;
+      for (let i = 0; i < count; i++) {
         s.particles.push({
           id: uid(),
           x,
           y,
-          vx: rand(-2.5, 2.5),
-          vy: rand(-2.5, 2.5),
-          life: rand(18, 34),
+          vx: rand(-3, 3),
+          vy: rand(-3, 3),
+          life: rand(18, big ? 52 : 34),
           ch,
         });
       }
@@ -258,6 +417,9 @@ export default function ShooterGame() {
     const update = (dt: number) => {
       const s = stateRef.current;
       if (s.gameOver) return;
+
+      const playerName = playerNameRef.current;
+      const { halfW, halfH } = playerBox(playerName);
 
       s.spawnTimer -= dt;
       const spawnEvery = Math.max(210, 900 - s.wave * 45);
@@ -268,6 +430,20 @@ export default function ShooterGame() {
           s.enemies.push(createEnemy(s.wave));
         }
         s.spawnTimer = spawnEvery;
+      }
+
+      s.wordTimer -= dt;
+      if (s.wave >= 2 && s.wordTimer <= 0) {
+        const word = pick(BOSS_WORDS);
+        const letters = createWordBoss(s.wave, word);
+        if (letters[0]?.groupId) {
+          s.groups[letters[0].groupId] = {
+            word,
+            remaining: word.length,
+          };
+        }
+        s.enemies.push(...letters);
+        s.wordTimer = Math.max(3500, 8500 - s.wave * 350);
       }
 
       for (const shot of s.shots) {
@@ -297,14 +473,19 @@ export default function ShooterGame() {
         enemy.y += (ny * enemy.speed + strafeY) * (dt / 16);
         enemy.z += 0.0025 * (enemy.speed + s.wave * 0.05) * (dt / 16);
 
-        if (
-          Math.hypot(enemy.x - CENTER_X, enemy.y - CENTER_Y) < 28 ||
-          enemy.z > 1.4
-        ) {
-          s.hp -= 1;
-          s.hitFlash = 10;
-          explode(enemy.x, enemy.y, enemy.ch);
+        const dx = Math.abs(enemy.x - CENTER_X);
+        const dy = Math.abs(enemy.y - CENTER_Y);
+        if ((dx < halfW + 8 && dy < halfH + 8) || enemy.z > 1.5) {
+          s.hp -= enemy.isWordBoss ? 2 : 1;
+          s.hitFlash = 12;
+          explode(enemy.x, enemy.y, enemy.ch, enemy.isWordBoss);
           enemy.dead = true;
+          if (enemy.groupId && s.groups[enemy.groupId]) {
+            s.groups[enemy.groupId].remaining -= 1;
+            if (s.groups[enemy.groupId].remaining <= 0) {
+              delete s.groups[enemy.groupId];
+            }
+          }
           if (s.hp <= 0) {
             s.gameOver = true;
             setGameOver(true);
@@ -316,15 +497,30 @@ export default function ShooterGame() {
         for (const enemy of s.enemies) {
           if (enemy.dead) continue;
           const scale = 0.7 + enemy.z * 1.6;
-          const hitRadius = 12 + scale * 8;
+          const hitRadius = (enemy.isWordBoss ? 18 : 12) + scale * 8;
           const d = Math.hypot(shot.x - enemy.x, shot.y - enemy.y);
           if (d < hitRadius) {
             enemy.hp -= 1;
             shot.life = 0;
             if (enemy.hp <= 0) {
               enemy.dead = true;
-              s.score += 10 + s.wave * 2;
-              explode(enemy.x, enemy.y, enemy.ch);
+              s.score += enemy.isWordBoss
+                ? 25 + s.wave * 4
+                : 10 + s.wave * 2;
+              explode(enemy.x, enemy.y, enemy.ch, enemy.isWordBoss);
+              if (enemy.groupId && s.groups[enemy.groupId]) {
+                s.groups[enemy.groupId].remaining -= 1;
+                if (s.groups[enemy.groupId].remaining <= 0) {
+                  const completed = s.groups[enemy.groupId].word;
+                  const bonus = 100 + s.wave * 25;
+                  s.score += bonus;
+                  s.banner = {
+                    text: `${completed} destroyed  +${bonus}`,
+                    life: 110,
+                  };
+                  delete s.groups[enemy.groupId];
+                }
+              }
             }
             break;
           }
@@ -342,6 +538,10 @@ export default function ShooterGame() {
       const nextWave = 1 + Math.floor(s.score / 120);
       if (nextWave !== s.wave) s.wave = nextWave;
       if (s.hitFlash > 0) s.hitFlash -= 1;
+      if (s.banner) {
+        s.banner.life -= 1;
+        if (s.banner.life <= 0) s.banner = null;
+      }
 
       setScore(s.score);
       setHp(s.hp);
@@ -353,37 +553,65 @@ export default function ShooterGame() {
     const draw = (now: number) => {
       const s = stateRef.current;
       drawBackground(ctx, now);
+      drawPlayerArea(ctx, playerNameRef.current, now, s.hitFlash > 0);
 
-      ctx.save();
-      ctx.font = "16px monospace";
-      ctx.fillStyle = "rgba(255,255,255,0.95)";
-      ctx.fillText(`HP ${s.hp}`, 20, 30);
-      ctx.fillText(`SCORE ${s.score}`, 100, 30);
-      ctx.fillText(`WAVE ${s.wave}`, 230, 30);
-      ctx.fillText(`AMMO ${BULLET_CHARS[ammoModeRef.current]}`, 340, 30);
-      ctx.fillStyle = "rgba(170,190,255,0.9)";
-      ctx.fillText(
-        "Aim with mouse or finger \u2022 tap / click / SPACE to shoot \u2022 1 2 3 switch ammo",
-        20,
-        HEIGHT - 18
-      );
-      ctx.restore();
+      // Connecting underlines for word bosses.
+      const byGroup: Record<string, Enemy[]> = {};
+      for (const e of s.enemies) {
+        if (!e.groupId) continue;
+        (byGroup[e.groupId] ??= []).push(e);
+      }
+      for (const gid in byGroup) {
+        const group = byGroup[gid];
+        if (group.length < 2) continue;
+        ctx.save();
+        ctx.strokeStyle = "rgba(255,210,120,0.55)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        group.sort((a, b) => a.x - b.x);
+        ctx.moveTo(group[0].x, group[0].y + 18);
+        for (let i = 1; i < group.length; i++) {
+          ctx.lineTo(group[i].x, group[i].y + 18);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
 
       const enemies = [...s.enemies].sort((a, b) => a.z - b.z);
       for (const enemy of enemies) {
-        const size = 18 + enemy.z * 42;
+        const size =
+          (enemy.isWordBoss ? 26 : 18) + enemy.z * (enemy.isWordBoss ? 54 : 42);
         ctx.save();
         ctx.translate(enemy.x, enemy.y);
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.font = `${size}px monospace`;
-        ctx.fillStyle = `rgba(255,${180 - enemy.z * 40},${
-          140 - enemy.z * 30
-        },0.95)`;
-        ctx.shadowBlur = 16;
-        ctx.shadowColor = "rgba(255,120,80,0.35)";
+        ctx.font = `${enemy.isWordBoss ? "bold " : ""}${size}px monospace`;
+        if (enemy.isWordBoss) {
+          ctx.fillStyle = `rgba(255,${220 - enemy.z * 30},${
+            120 - enemy.z * 20
+          },0.98)`;
+          ctx.shadowBlur = 24;
+          ctx.shadowColor = "rgba(255,180,60,0.6)";
+        } else {
+          ctx.fillStyle = `rgba(255,${180 - enemy.z * 40},${
+            140 - enemy.z * 30
+          },0.95)`;
+          ctx.shadowBlur = 16;
+          ctx.shadowColor = "rgba(255,120,80,0.35)";
+        }
         ctx.fillText(enemy.ch, 0, 0);
         ctx.restore();
+
+        if (enemy.maxHp > 1 && enemy.hp < enemy.maxHp) {
+          const barW = size * 0.9;
+          const barH = 3;
+          const bx = enemy.x - barW / 2;
+          const by = enemy.y - size * 0.75;
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          ctx.fillRect(bx, by, barW, barH);
+          ctx.fillStyle = "rgba(255,140,100,0.9)";
+          ctx.fillRect(bx, by, barW * (enemy.hp / enemy.maxHp), barH);
+        }
       }
 
       for (const shot of s.shots) {
@@ -404,6 +632,35 @@ export default function ShooterGame() {
         ctx.textBaseline = "middle";
         ctx.fillStyle = "rgba(255,220,180,0.85)";
         ctx.fillText(p.ch, p.x, p.y);
+        ctx.restore();
+      }
+
+      // HUD
+      ctx.save();
+      ctx.font = "16px monospace";
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.fillText(`HP ${s.hp}`, 20, 30);
+      ctx.fillText(`SCORE ${s.score}`, 100, 30);
+      ctx.fillText(`WAVE ${s.wave}`, 230, 30);
+      ctx.fillText(`AMMO ${BULLET_CHARS[ammoModeRef.current]}`, 340, 30);
+      ctx.fillText(`NAME ${playerNameRef.current}`, 460, 30);
+      ctx.fillStyle = "rgba(170,190,255,0.85)";
+      ctx.fillText(
+        "Aim with mouse or finger \u2022 tap / click / SPACE to shoot \u2022 1 2 3 switch ammo",
+        20,
+        HEIGHT - 18
+      );
+      ctx.restore();
+
+      if (s.banner) {
+        ctx.save();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = "bold 28px monospace";
+        ctx.fillStyle = `rgba(255,210,120,${Math.min(1, s.banner.life / 30)})`;
+        ctx.shadowBlur = 16;
+        ctx.shadowColor = "rgba(255,180,60,0.6)";
+        ctx.fillText(s.banner.text, CENTER_X, 80);
         ctx.restore();
       }
 
@@ -451,6 +708,13 @@ export default function ShooterGame() {
     };
     frameRef.current = requestAnimationFrame(loop);
 
+    const setAim = (clientX: number, clientY: number) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseRef.current = {
+        x: ((clientX - rect.left) / rect.width) * WIDTH,
+        y: ((clientY - rect.top) / rect.height) * HEIGHT,
+      };
+    };
     const onTouchMove = (e: TouchEvent) => {
       if (e.touches.length === 0) return;
       e.preventDefault();
@@ -465,24 +729,50 @@ export default function ShooterGame() {
     };
   }, [started, shoot]);
 
-  // Draw the idle/start screen when not playing.
+  // Draw idle/start screen.
   useEffect(() => {
     if (started) return;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
-    drawBackground(ctx, performance.now());
-    ctx.fillStyle = "rgba(4,8,20,0.55)";
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
-    ctx.textAlign = "center";
-    ctx.fillStyle = "white";
-    ctx.font = "bold 44px monospace";
-    ctx.fillText("LETTER FPS", CENTER_X, CENTER_Y - 60);
-    ctx.font = "20px monospace";
-    ctx.fillText("Shoot A, B, C ... as they rush toward you", CENTER_X, CENTER_Y - 16);
-    ctx.fillText("Your bullets are .   /   ;", CENTER_X, CENTER_Y + 16);
-    ctx.fillText("Tap Start below", CENTER_X, CENTER_Y + 60);
-  }, [started]);
+    let raf = 0;
+    const tick = (now: number) => {
+      drawBackground(ctx, now);
+      drawPlayerArea(
+        ctx,
+        playerName.length === 0 ? "AAA" : playerName,
+        now,
+        false
+      );
+      ctx.fillStyle = "rgba(4,8,20,0.45)";
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "white";
+      ctx.font = "bold 46px monospace";
+      ctx.fillText("LETTER FPS", CENTER_X, 130);
+      ctx.font = "20px monospace";
+      ctx.fillStyle = "rgba(220,230,255,0.92)";
+      ctx.fillText(
+        "Letters rush you. Words form and hit harder.",
+        CENTER_X,
+        170
+      );
+      ctx.fillStyle = "rgba(170,220,255,0.85)";
+      ctx.fillText(
+        "Your name is your body - defend it.",
+        CENTER_X,
+        HEIGHT - 120
+      );
+      ctx.fillText(
+        "Pick a 3-letter name above, then tap Start.",
+        CENTER_X,
+        HEIGHT - 90
+      );
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [started, playerName]);
 
   const onCanvasPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -494,9 +784,7 @@ export default function ShooterGame() {
         y: ((e.clientY - rect.top) / rect.height) * HEIGHT,
       };
       pointerDownRef.current = true;
-      if (e.pointerType === "touch") {
-        e.preventDefault();
-      }
+      if (e.pointerType === "touch") e.preventDefault();
       shoot();
     },
     [shoot]
@@ -519,22 +807,39 @@ export default function ShooterGame() {
   );
 
   return (
-    <div className="min-h-[100svh] bg-slate-950 text-slate-100 p-3 sm:p-6 flex items-start sm:items-center justify-center">
+    <div className="min-h-[100svh] bg-slate-950 text-slate-100 p-2 sm:p-6 flex items-start sm:items-center justify-center">
       <div className="w-full max-w-6xl">
-        <div className="mb-3 flex flex-col gap-2 sm:mb-4 sm:flex-row sm:items-end sm:justify-between">
+        <div className="mb-2 flex flex-col gap-2 sm:mb-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">
+            <h1 className="text-xl sm:text-3xl font-bold tracking-tight">
               Letter FPS prototype
             </h1>
-            <p className="text-slate-300 text-sm sm:text-base">
-              A lightweight browser shooter where letters become the enemies.
+            <p className="text-slate-300 text-xs sm:text-base">
+              Letters rush you. Words form and hit harder. Your name is your
+              body.
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 rounded-2xl bg-white/5 px-3 py-2 text-sm">
+              <span className="text-slate-400 uppercase tracking-wider text-xs">
+                Name
+              </span>
+              <input
+                value={playerName}
+                onChange={onNameChange}
+                onBlur={onNameBlur}
+                maxLength={3}
+                disabled={started && !gameOver}
+                placeholder="AAA"
+                className="w-14 bg-transparent font-mono text-lg uppercase outline-none placeholder:text-slate-500 disabled:opacity-60"
+                aria-label="Three letter player name"
+              />
+            </label>
             <button
               type="button"
-              onClick={() => setStarted(true)}
-              className="touch-manipulation rounded-2xl bg-white/10 px-4 py-2 text-sm sm:text-base hover:bg-white/20 active:bg-white/30"
+              onClick={startGame}
+              disabled={started && !gameOver}
+              className="touch-manipulation rounded-2xl bg-white/10 px-4 py-2 text-sm sm:text-base hover:bg-white/20 active:bg-white/30 disabled:opacity-40"
             >
               Start
             </button>
@@ -568,32 +873,57 @@ export default function ShooterGame() {
           onPointerCancel={onCanvasPointerUp}
           onContextMenu={(e) => e.preventDefault()}
           className="block w-full touch-none select-none rounded-2xl border border-white/10 bg-slate-900 shadow-2xl sm:rounded-3xl"
-          style={{ aspectRatio: `${WIDTH} / ${HEIGHT}` }}
+          style={{
+            aspectRatio: `${WIDTH} / ${HEIGHT}`,
+            maxHeight: "72svh",
+          }}
         />
 
-        <div className="mt-3 flex flex-wrap gap-2 sm:hidden">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs uppercase tracking-wider text-slate-400">
+            Ammo
+          </span>
           {BULLET_CHARS.map((ch, i) => (
             <button
               key={ch}
               type="button"
               onClick={() => setAmmoMode(i)}
-              className={`touch-manipulation rounded-xl px-4 py-2 font-mono text-lg ${
+              className={`touch-manipulation rounded-xl px-4 py-2 font-mono text-lg transition ${
                 ammoMode === i
-                  ? "bg-cyan-400/30 text-white"
-                  : "bg-white/10 text-slate-200"
+                  ? "bg-cyan-400/30 text-white ring-1 ring-cyan-300/60"
+                  : "bg-white/10 text-slate-200 hover:bg-white/20"
               }`}
+              aria-pressed={ammoMode === i}
+              aria-label={`Ammo ${ch}`}
             >
               {ch}
             </button>
           ))}
+          <span className="ml-auto text-xs text-slate-400">
+            HP {hp} &bull; Score {score} &bull; Wave {wave} &bull; Ammo{" "}
+            <span className="font-mono text-slate-200">{weaponLabel}</span>
+            {gameOver && <span className="text-rose-300"> &bull; Game over</span>}
+          </span>
         </div>
 
-        <div className="mt-4 grid gap-3 md:grid-cols-3">
+        <div className="mt-4 hidden gap-3 sm:grid md:grid-cols-3">
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <div className="text-sm text-slate-400">Core idea</div>
+            <div className="text-sm text-slate-400">Player zone</div>
             <div className="mt-1 text-sm">
-              Letters rush the player from the screen depth plane. Difficulty
-              rises by faster spawns and tougher letters.
+              The dashed outline around{" "}
+              <span className="font-mono">{playerName || "AAA"}</span> is the
+              area attackers need to reach. Pick a shorter name for a smaller
+              hitbox.
+            </div>
+          </div>
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+            <div className="text-sm text-slate-400">Word bosses</div>
+            <div className="mt-1 text-sm">
+              From wave 2, letters arrive in coordinated words
+              (<span className="font-mono">RUSH</span>,{" "}
+              <span className="font-mono">DOOM</span>,{" "}
+              <span className="font-mono">FIRE</span> ...). They are tougher,
+              hit harder, and pay a bonus when fully destroyed.
             </div>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
@@ -602,17 +932,8 @@ export default function ShooterGame() {
               Bullets are punctuation marks:{" "}
               <span className="font-mono">.</span>,{" "}
               <span className="font-mono">/</span>,{" "}
-              <span className="font-mono">;</span>. Current:{" "}
-              <span className="font-mono">{weaponLabel}</span>
-              <span className="text-slate-400"> • HP {hp} • Score {score} • Wave {wave}</span>
-              {gameOver && <span className="text-rose-300"> • Game over</span>}
-            </div>
-          </div>
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <div className="text-sm text-slate-400">Deployment</div>
-            <div className="mt-1 text-sm">
-              This prototype is static and deploys to Vercel, Cloudflare Pages,
-              Netlify, or GitHub Pages.
+              <span className="font-mono">;</span>. Switch with 1 2 3 or the
+              buttons above.
             </div>
           </div>
         </div>
